@@ -4,11 +4,15 @@ main.py  (refactored)
 FastAPI application.
 """
 
+import asyncio
+import csv
+import io
+import json as json_mod
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -478,6 +482,257 @@ def generate_pdf_report(scan_id: int):
         filename=f"security_report_{scan.target}_{scan_id}.pdf",
         media_type="application/pdf"
     )
+
+
+# ── JSON export ───────────────────────────────────────────────────────────────
+
+@app.get("/report/{scan_id}/json")
+def generate_json_report(scan_id: int):
+    """Download the full scan report as a JSON file."""
+    with get_session() as session:
+        scan = session.get(Scan, scan_id)
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        ports = session.exec(select(Port).where(Port.scan_id == scan_id)).all()
+        nuclei_findings = session.exec(
+            select(NucleiFinding).where(NucleiFinding.scan_id == scan_id)
+        ).all()
+
+    vuln_results = get_unified_vulnerabilities(ports)
+
+    nuclei_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for f in nuclei_findings:
+        sev = (f.severity or "info").lower()
+        if sev in nuclei_sev:
+            nuclei_sev[sev] += 1
+
+    scan_result_for_ml = {
+        "open_ports":      [{"port": p.port, "is_web": p.is_web} for p in ports],
+        "nuclei_findings": [{"severity": f.severity} for f in nuclei_findings],
+        "severity_summary": nuclei_sev,
+    }
+    risk = calculate_ml_risk(scan_result_for_ml, vuln_results)
+
+    report_data = {
+        "scan_id":         scan_id,
+        "target":          scan.target,
+        "status":          scan.status,
+        "scan_date":       scan.created_at.isoformat() if scan.created_at else None,
+        "completed_at":    scan.completed_at.isoformat() if scan.completed_at else None,
+        "risk_score":      risk["risk_score"],
+        "risk_level":      risk["risk_level"],
+        "confidence":      risk.get("confidence", 0),
+        "severity_summary": nuclei_sev,
+        "open_ports": [
+            {"port": p.port, "service": p.service, "product": p.product,
+             "version": p.version, "is_web": p.is_web}
+            for p in ports
+        ],
+        "nuclei_findings": [
+            {"template_id": f.template_id, "template_name": f.template_name,
+             "severity": f.severity, "host": f.host, "matched_at": f.matched_at,
+             "description": f.description, "tags": f.tags}
+            for f in nuclei_findings
+        ],
+        "cve_vulnerabilities": vuln_results,
+    }
+
+    json_bytes = json_mod.dumps(report_data, indent=2, default=str).encode("utf-8")
+    return StreamingResponse(
+        io.BytesIO(json_bytes),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="report_{scan.target}_{scan_id}.json"'},
+    )
+
+
+# ── CSV export ────────────────────────────────────────────────────────────────
+
+@app.get("/report/{scan_id}/csv")
+def generate_csv_report(scan_id: int):
+    """Download the scan report as a flat CSV file."""
+    with get_session() as session:
+        scan = session.get(Scan, scan_id)
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        ports = session.exec(select(Port).where(Port.scan_id == scan_id)).all()
+        nuclei_findings = session.exec(
+            select(NucleiFinding).where(NucleiFinding.scan_id == scan_id)
+        ).all()
+
+    vuln_results = get_unified_vulnerabilities(ports)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "type", "port", "service", "product", "version",
+        "severity", "cve_id", "template_id", "description",
+        "matched_at", "tags",
+    ])
+
+    # Port rows
+    for p in ports:
+        writer.writerow([
+            "port", p.port, p.service or "", p.product or "", p.version or "",
+            "", "", "", "", "", "",
+        ])
+
+    # Nuclei finding rows
+    for f in nuclei_findings:
+        writer.writerow([
+            "nuclei", "", "", "", "",
+            f.severity or "", "", f.template_id or "",
+            (f.description or "")[:500], f.matched_at or "", f.tags or "",
+        ])
+
+    # CVE vulnerability rows
+    for v in vuln_results:
+        writer.writerow([
+            "cve", v.get("port", ""), v.get("service", ""),
+            v.get("product", ""), v.get("version", ""),
+            v.get("severity", ""), v.get("cve", ""), "",
+            (v.get("description", "") or "")[:500], "", "",
+        ])
+
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="report_{scan.target}_{scan_id}.csv"'},
+    )
+
+
+# ── WebSocket live scan progress ──────────────────────────────────────────────
+
+PHASE_PCT = {
+    "queued": 5, "scanning_ports": 40, "nmap": 40, "probing_http": 55,
+    "scanning_web": 75, "nuclei": 75, "complete": 100, "done": 100, "failed": 100,
+}
+
+
+@app.websocket("/ws/scan/{scan_id}")
+async def ws_scan_progress(websocket: WebSocket, scan_id: int):
+    await websocket.accept()
+    try:
+        prev_phase = None
+        while True:
+            with get_session() as session:
+                scan = session.get(Scan, scan_id)
+
+            if not scan:
+                await websocket.send_json({"type": "error", "detail": "Scan not found"})
+                break
+
+            phase  = scan.phase or "queued"
+            status = scan.status or "queued"
+
+            # Only send updates when the phase changes (or first message)
+            if phase != prev_phase:
+                pct = PHASE_PCT.get(phase, 5)
+                if phase in ("done", "complete"):
+                    await websocket.send_json({
+                        "type": "complete", "scan_id": scan_id,
+                        "phase": "done", "pct": 100,
+                    })
+                    break
+                elif phase == "failed" or status.startswith("failed"):
+                    await websocket.send_json({
+                        "type": "failed", "scan_id": scan_id,
+                        "phase": "failed", "status": status, "pct": 100,
+                    })
+                    break
+                else:
+                    await websocket.send_json({
+                        "type": "progress", "scan_id": scan_id,
+                        "phase": phase, "status": status, "pct": pct,
+                    })
+                prev_phase = phase
+
+            await asyncio.sleep(1.5)
+    except WebSocketDisconnect:
+        pass
+
+
+# ── Scan diff (compare two scans) ─────────────────────────────────────────────
+
+@app.get("/scan/diff")
+def diff_scans(scan_a: int = Query(...), scan_b: int = Query(...)):
+    """Compare two scans and return added/removed/unchanged ports and findings."""
+    with get_session() as session:
+        sa = session.get(Scan, scan_a)
+        sb = session.get(Scan, scan_b)
+        if not sa or not sb:
+            raise HTTPException(status_code=404, detail="One or both scans not found")
+
+        ports_a = session.exec(select(Port).where(Port.scan_id == scan_a)).all()
+        ports_b = session.exec(select(Port).where(Port.scan_id == scan_b)).all()
+        nf_a    = session.exec(select(NucleiFinding).where(NucleiFinding.scan_id == scan_a)).all()
+        nf_b    = session.exec(select(NucleiFinding).where(NucleiFinding.scan_id == scan_b)).all()
+
+    # ── Port diff (keyed by port number) ──────────────────────────────────
+    def port_dict(p):
+        return {"port": p.port, "service": p.service, "product": p.product,
+                "version": p.version, "is_web": p.is_web}
+
+    set_a = {p.port for p in ports_a}
+    set_b = {p.port for p in ports_b}
+
+    ports_added   = [port_dict(p) for p in ports_b if p.port not in set_a]
+    ports_removed = [port_dict(p) for p in ports_a if p.port not in set_b]
+    ports_unchanged = [port_dict(p) for p in ports_b if p.port in set_a]
+
+    # ── Nuclei diff (keyed by template_id + matched_at) ───────────────────
+    def finding_dict(f):
+        return {"template_id": f.template_id, "template_name": f.template_name,
+                "severity": f.severity, "host": f.host, "matched_at": f.matched_at,
+                "description": f.description, "tags": f.tags}
+
+    def finding_key(f):
+        return (f.template_id or "", f.matched_at or "")
+
+    keys_a = {finding_key(f) for f in nf_a}
+    keys_b = {finding_key(f) for f in nf_b}
+
+    findings_new       = [finding_dict(f) for f in nf_b if finding_key(f) not in keys_a]
+    findings_fixed     = [finding_dict(f) for f in nf_a if finding_key(f) not in keys_b]
+    findings_unchanged = [finding_dict(f) for f in nf_b if finding_key(f) in keys_a]
+
+    # ── Risk delta ────────────────────────────────────────────────────────
+    def risk_for(ports_list, nf_list):
+        sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+        for f in nf_list:
+            s = (f.severity or "info").lower()
+            if s in sev:
+                sev[s] += 1
+        sr = {
+            "open_ports":      [{"port": p.port, "is_web": p.is_web} for p in ports_list],
+            "nuclei_findings": [{"severity": f.severity} for f in nf_list],
+            "severity_summary": sev,
+        }
+        return calculate_ml_risk(sr, [])
+
+    risk_a = risk_for(ports_a, nf_a)
+    risk_b = risk_for(ports_b, nf_b)
+
+    return {
+        "scan_a": {"id": sa.id, "target": sa.target,
+                   "created_at": sa.created_at.isoformat() if sa.created_at else None},
+        "scan_b": {"id": sb.id, "target": sb.target,
+                   "created_at": sb.created_at.isoformat() if sb.created_at else None},
+        "ports": {
+            "added":     ports_added,
+            "removed":   ports_removed,
+            "unchanged": ports_unchanged,
+        },
+        "nuclei_findings": {
+            "new":       findings_new,
+            "fixed":     findings_fixed,
+            "unchanged": findings_unchanged,
+        },
+        "risk_delta": {
+            "before": {"score": risk_a["risk_score"], "level": risk_a["risk_level"]},
+            "after":  {"score": risk_b["risk_score"], "level": risk_b["risk_level"]},
+        },
+    }
 
 
 @app.get("/live-vulnerabilities/{scan_id}")

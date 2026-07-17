@@ -5,6 +5,7 @@ import { Link, useNavigate } from "react-router-dom";
 // localhost, a VM's IP, or a Docker service name. Falls back to
 // localhost for local `npm run dev`.
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const WS_API = API.replace(/^http/, "ws");
 
 const PHASE_STEPS = {
   queued:        { label: "Queued",            pct: 5  },
@@ -91,7 +92,9 @@ export default function Dashboard() {
   const [target, setTarget] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError]   = useState("");
+  const [compareSet, setCompareSet] = useState(new Set());
   const pollRefs = useRef({});
+  const wsRefs   = useRef({});
   const navigate = useNavigate();
 
   const loadHistory = async () => {
@@ -106,7 +109,11 @@ export default function Dashboard() {
   useEffect(() => {
     loadHistory();
     const iv = setInterval(loadHistory, 4000);
-    return () => { clearInterval(iv); Object.values(pollRefs.current).forEach(clearInterval); };
+    return () => {
+      clearInterval(iv);
+      Object.values(pollRefs.current).forEach(clearInterval);
+      Object.values(wsRefs.current).forEach(ws => ws.close());
+    };
   }, []);
 
   const startScan = async () => {
@@ -132,18 +139,44 @@ export default function Dashboard() {
       
       setTarget("");
       await loadHistory();
-      
-      const iv = setInterval(async () => {
-        const r = await fetch(`${API}/scan/status/${data.task_id}`);
-        const s = await r.json();
-        if (s.state === "SUCCESS" || s.state === "FAILURE") {
-          clearInterval(iv);
-          delete pollRefs.current[data.task_id];
-          await loadHistory();
-          navigate(`/scan/${data.scan_id}`);
-        }
-      }, 3000);
-      pollRefs.current[data.task_id] = iv;
+
+      // Try WebSocket for live progress
+      try {
+        const ws = new WebSocket(`${WS_API}/ws/scan/${data.scan_id}`);
+        wsRefs.current[data.scan_id] = ws;
+        ws.onmessage = async (event) => {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "complete" || msg.type === "failed") {
+            ws.close();
+            delete wsRefs.current[data.scan_id];
+            await loadHistory();
+            if (msg.type === "complete") navigate(`/scan/${data.scan_id}`);
+          } else {
+            await loadHistory();
+          }
+        };
+        ws.onerror = () => {
+          ws.close();
+          delete wsRefs.current[data.scan_id];
+          startHttpPolling(data);
+        };
+      } catch {
+        startHttpPolling(data);
+      }
+
+      function startHttpPolling(data) {
+        const iv = setInterval(async () => {
+          const r = await fetch(`${API}/scan/status/${data.task_id}`);
+          const s = await r.json();
+          if (s.state === "SUCCESS" || s.state === "FAILURE") {
+            clearInterval(iv);
+            delete pollRefs.current[data.task_id];
+            await loadHistory();
+            if (s.state === "SUCCESS") navigate(`/scan/${data.scan_id}`);
+          }
+        }, 3000);
+        pollRefs.current[data.task_id] = iv;
+      }
     } catch { setError("Failed to start scan"); }
     
     setLoading(false);
@@ -152,6 +185,15 @@ export default function Dashboard() {
   const completed = scans.filter(s => s.phase === "done").length;
   const failed    = scans.filter(s => s.phase === "failed").length;
   const running   = scans.filter(s => !["done","failed"].includes(s.phase)).length;
+
+  const toggleCompare = (id) => {
+    setCompareSet(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else if (next.size < 2) next.add(id);
+      return next;
+    });
+  };
 
   return (
     <div style={{ minHeight: "100vh", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-mono)", padding: "2rem" }}>
@@ -233,9 +275,30 @@ export default function Dashboard() {
             <h2 style={{ margin: 0, fontSize: "1rem", fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--text-muted)" }}>
               Scan History
             </h2>
-            <button onClick={loadHistory} style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-muted)", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: 12, fontFamily: "var(--font-mono)" }}>
-              ↻ Refresh
-            </button>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              {compareSet.size === 2 && (
+                <button
+                  onClick={() => {
+                    const [a, b] = [...compareSet].sort((x, y) => x - y);
+                    navigate(`/diff?a=${a}&b=${b}`);
+                  }}
+                  style={{
+                    background: "#a78bfa", color: "#000",
+                    border: "none", padding: "6px 16px", borderRadius: 6,
+                    cursor: "pointer", fontSize: 12, fontWeight: 700,
+                    fontFamily: "var(--font-mono)", letterSpacing: "0.04em",
+                  }}
+                >
+                  ↔ Compare Scans
+                </button>
+              )}
+              {compareSet.size > 0 && compareSet.size < 2 && (
+                <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Select 1 more to compare</span>
+              )}
+              <button onClick={loadHistory} style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-muted)", padding: "6px 14px", borderRadius: 6, cursor: "pointer", fontSize: 12, fontFamily: "var(--font-mono)" }}>
+                ↻ Refresh
+              </button>
+            </div>
           </div>
 
           {scans.length === 0 ? (
@@ -246,14 +309,27 @@ export default function Dashboard() {
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
               <thead>
                 <tr style={{ borderBottom: "1px solid var(--border)" }}>
-                  {["ID", "Target", "Status", "Progress", "Started", "Action"].map(h => (
-                    <th key={h} style={{ textAlign: "left", padding: "10px 16px", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)", fontWeight: 600 }}>{h}</th>
+                  {["☐", "ID", "Target", "Status", "Progress", "Started", "Action"].map(h => (
+                    <th key={h} style={{ textAlign: "left", padding: "10px 16px", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--text-muted)", fontWeight: 600, ...(h === "☐" ? { width: 40, textAlign: "center" } : {}) }}>{h === "☐" ? "Diff" : h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {scans.map(scan => (
                   <tr key={scan.id} style={{ borderBottom: "1px solid var(--border)" }}>
+                    <td style={{ padding: "14px 16px", textAlign: "center" }}>
+                      {scan.phase === "done" ? (
+                        <input
+                          type="checkbox"
+                          checked={compareSet.has(scan.id)}
+                          onChange={() => toggleCompare(scan.id)}
+                          disabled={!compareSet.has(scan.id) && compareSet.size >= 2}
+                          style={{ cursor: "pointer", accentColor: "#a78bfa" }}
+                        />
+                      ) : (
+                        <span style={{ color: "var(--border)" }}>—</span>
+                      )}
+                    </td>
                     <td style={{ padding: "14px 16px", color: "var(--text-muted)", fontSize: 13 }}>#{scan.id}</td>
                     <td style={{ padding: "14px 16px", fontWeight: 600, fontSize: 14 }}>{scan.target}</td>
                     <td style={{ padding: "14px 16px" }}><StatusBadge phase={scan.phase} /></td>

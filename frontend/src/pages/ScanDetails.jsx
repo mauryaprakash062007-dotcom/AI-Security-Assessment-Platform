@@ -2,6 +2,7 @@ import { useParams, Link } from "react-router-dom";
 import { useEffect, useState, useCallback, useRef } from "react";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const WS_API = API.replace(/^http/, "ws");
 
 const SEV_STYLE = {
   critical:              { bg: "#7f1d1d33", color: "#f87171",  border: "#f8717144" },
@@ -118,28 +119,62 @@ export default function ScanDetails() {
   }, [id]);
 
   useEffect(() => {
-    let iv;
     let stopped = false;
+    let iv = null;
+    let ws = null;
 
-    const poll = async () => {
-      const data = await loadScanResult();
+    // Initial load from DB
+    loadScanResult().then((data) => {
       if (!data || stopped) return;
-
       if (data.phase === "done") {
-        stopped = true;
-        clearInterval(iv);
-        // Wait 800ms for DB writes to fully commit before loading report
         setTimeout(() => loadReport(), 800);
-      } else if (data.phase === "failed") {
-        stopped = true;
-        clearInterval(iv);
+        return;
       }
-    };
+      if (data.phase === "failed") return;
 
-    poll();
-    iv = setInterval(poll, 3000);
-    return () => { stopped = true; clearInterval(iv); };
-  }, [loadScanResult, loadReport]);
+      // Try WebSocket for live updates
+      try {
+        ws = new WebSocket(`${WS_API}/ws/scan/${id}`);
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data);
+          if (msg.type === "progress") {
+            setPhase(msg.phase);
+          } else if (msg.type === "complete") {
+            setPhase("done");
+            loadScanResult().then(() => setTimeout(() => loadReport(), 800));
+          } else if (msg.type === "failed") {
+            setPhase("failed");
+            loadScanResult();
+          }
+        };
+        ws.onerror = () => startPolling();
+        ws.onclose = () => { ws = null; };
+      } catch {
+        startPolling();
+      }
+    });
+
+    // Fallback: HTTP polling
+    function startPolling() {
+      if (stopped || iv) return;
+      iv = setInterval(async () => {
+        const data = await loadScanResult();
+        if (!data || stopped) return;
+        if (data.phase === "done") {
+          clearInterval(iv);
+          setTimeout(() => loadReport(), 800);
+        } else if (data.phase === "failed") {
+          clearInterval(iv);
+        }
+      }, 3000);
+    }
+
+    return () => {
+      stopped = true;
+      if (iv) clearInterval(iv);
+      if (ws) ws.close();
+    };
+  }, [id, loadScanResult, loadReport]);
 
   // ── Render ──────────────────────────────────────────────────────────────
 
@@ -497,24 +532,30 @@ export default function ScanDetails() {
 
         {/* Actions */}
         {phase === "done" && (
-          <div style={{ display: "flex", gap: 12, marginBottom: "2rem" }}>
-            <a
-              href={`${API}/report/${id}/pdf`}
-              target="_blank"
-              rel="noreferrer"
-              style={{
-                background: "var(--green)",
-                color: "#000",
-                padding: "12px 24px",
-                borderRadius: 8,
-                fontWeight: 700,
-                fontSize: 14,
-                textDecoration: "none",
-                fontFamily: "var(--font-mono)",
-              }}
-            >
-              ↓ Download PDF Report
-            </a>
+          <div style={{ display: "flex", gap: 12, marginBottom: "2rem", flexWrap: "wrap" }}>
+            {[
+              { href: `${API}/report/${id}/pdf`,  label: "↓ PDF Report",  bg: "var(--green)",  color: "#000" },
+              { href: `${API}/report/${id}/json`, label: "↓ JSON Export", bg: "var(--accent)", color: "#000" },
+              { href: `${API}/report/${id}/csv`,  label: "↓ CSV Export",  bg: "#a78bfa",       color: "#000" },
+            ].map(({ href, label, bg, color }) => (
+              <a
+                key={label}
+                href={href}
+                target="_blank"
+                rel="noreferrer"
+                style={{
+                  background: bg, color,
+                  padding: "12px 24px", borderRadius: 8,
+                  fontWeight: 700, fontSize: 14,
+                  textDecoration: "none", fontFamily: "var(--font-mono)",
+                  transition: "opacity 0.2s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.opacity = "0.85"}
+                onMouseLeave={e => e.currentTarget.style.opacity = "1"}
+              >
+                {label}
+              </a>
+            ))}
             <Link
               to="/"
               style={{
