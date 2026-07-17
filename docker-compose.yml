@@ -1,0 +1,76 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: security_platform
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db/security_platform
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # nmap needs raw-socket access for SYN scans; this is the container-native
+    # replacement for "run nmap as root" without giving the whole
+    # container --privileged access.
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: celery -A celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db/security_platform
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Change this to your VM/server's reachable address+port if the
+        # browser will be on a different machine than the backend.
+        VITE_API_URL: http://localhost:8000
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  db_data:

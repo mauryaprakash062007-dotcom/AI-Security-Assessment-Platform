@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+.git/
+.gitignore
+frontend/node_modules
+frontend/dist
+*.pkl.bak
+.env

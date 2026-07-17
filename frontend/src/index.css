@@ -1,0 +1,11 @@
+
+@import "tailwindcss";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+:root {
+  --bg: #0a0e17; --surface: #111827; --border: #1f2937;
+  --text: #e2e8f0; --text-muted: #6b7280; --accent: #38bdf8;
+  --green: #4ade80; --red: #f87171; --yellow: #fbbf24;
+  --font-mono: monospace; --font-display: sans-serif;
+}
