@@ -9,7 +9,7 @@
 - PostgreSQL storage, Celery + Redis for async scan jobs
 - React (Vite) frontend
 
-> ⚠️ **Only scan hosts you own or are explicitly authorized to test.**
+>  **Only scan hosts you own or are explicitly authorized to test.**
 > Good practice targets: `scanme.nmap.org` (nmap's official test host),
 > a VM you control, or a deliberately vulnerable app like OWASP Juice Shop / DVWA / Metasploitable.
 
