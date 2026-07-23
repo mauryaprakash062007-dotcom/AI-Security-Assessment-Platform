@@ -200,17 +200,27 @@ export default function Dashboard() {
       <div style={{ maxWidth: 1100, margin: "0 auto" }}>
 
         {/* Header */}
-        <div style={{ marginBottom: "2.5rem" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
-            <div style={{ width: 10, height: 10, borderRadius: "50%", background: "var(--accent)", boxShadow: "0 0 8px var(--accent)" }} />
-            <span style={{ color: "var(--accent)", fontSize: 12, letterSpacing: "0.15em", textTransform: "uppercase" }}>Security Platform</span>
+        <div style={{ marginBottom: "2.5rem", display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+              <div style={{ width: 10, height: 10, borderRadius: "50%", background: "var(--accent)", boxShadow: "0 0 8px var(--accent)" }} />
+              <span style={{ color: "var(--accent)", fontSize: 12, letterSpacing: "0.15em", textTransform: "uppercase" }}>Security Platform</span>
+            </div>
+            <h1 style={{ fontSize: "2.8rem", fontWeight: 800, fontFamily: "var(--font-display)", letterSpacing: "-0.02em", margin: 0 }}>
+              Vulnerability Scanner
+            </h1>
+            <p style={{ color: "var(--text-muted)", marginTop: 6, fontSize: 14 }}>
+              Nmap + Nuclei async pipeline · PostgreSQL backed
+            </p>
           </div>
-          <h1 style={{ fontSize: "2.8rem", fontWeight: 800, fontFamily: "var(--font-display)", letterSpacing: "-0.02em", margin: 0 }}>
-            Vulnerability Scanner
-          </h1>
-          <p style={{ color: "var(--text-muted)", marginTop: 6, fontSize: 14 }}>
-            Nmap + Nuclei async pipeline · PostgreSQL backed
-          </p>
+          <Link to="/threat-intelligence" style={{
+            background: "#7f1d1d22", border: "1px solid var(--red)", color: "var(--red)",
+            padding: "10px 18px", borderRadius: 8, fontSize: 13, fontWeight: 700,
+            textDecoration: "none", display: "flex", alignItems: "center", gap: 8,
+            transition: "all 0.2s"
+          }}>
+            <span style={{ animation: "pulse 2s infinite" }}>🚨</span> Zero-Day Intel (ATEM)
+          </Link>
         </div>
 
         {error && (
@@ -334,7 +344,7 @@ export default function Dashboard() {
                     <td style={{ padding: "14px 16px", fontWeight: 600, fontSize: 14 }}>{scan.target}</td>
                     <td style={{ padding: "14px 16px" }}><StatusBadge phase={scan.phase} /></td>
                     <td style={{ padding: "14px 16px", minWidth: 160 }}><ScanProgressBar phase={scan.phase} /></td>
-                    <td style={{ padding: "14px 16px", color: "var(--text-muted)", fontSize: 12 }}>{new Date(scan.created_at).toLocaleString()}</td>
+                    <td style={{ padding: "14px 16px", color: "var(--text-muted)", fontSize: 12 }}>{new Date(scan.created_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}</td>
                     <td style={{ padding: "14px 16px" }}>
                       {scan.phase === "done" ? (
                         <Link to={`/scan/${scan.id}`} style={{ background: "var(--accent)", color: "#000", padding: "6px 14px", borderRadius: 6, fontSize: 12, fontWeight: 700, textDecoration: "none", fontFamily: "var(--font-mono)" }}>

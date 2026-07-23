@@ -29,6 +29,10 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db/security_platform
       REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      PLATFORM_API_KEY: ${PLATFORM_API_KEY}
+      ALLOW_PRIVATE_IPS: "true"
     ports:
       - "8000:8000"
     depends_on:
@@ -36,6 +40,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     # nmap needs raw-socket access for SYN scans; this is the container-native
     # replacement for "run nmap as root" without giving the whole
     # container --privileged access.
@@ -50,14 +57,41 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:postgres@db/security_platform
       REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      PLATFORM_API_KEY: ${PLATFORM_API_KEY}
+      ALLOW_PRIVATE_IPS: "true"
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     cap_add:
       - NET_RAW
       - NET_ADMIN
+
+  celery-beat:
+    build: .
+    restart: unless-stopped
+    command: celery -A celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db/security_platform
+      REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      PLATFORM_API_KEY: ${PLATFORM_API_KEY}
+      ALLOW_PRIVATE_IPS: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
 
   frontend:
     build:

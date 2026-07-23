@@ -20,15 +20,18 @@ def get_unified_vulnerabilities(ports):
     findings = []
 
     for port in ports:
-        # Skip ports with no useful product info
-        if not port.product or port.product.strip() in ("", "None"):
+        # Skip ports with no useful info
+        if not getattr(port, 'cpe', "") and (not port.product or port.product.strip() in ("", "None")):
             continue
 
-        query = _build_query(port.product, port.version,port.service)
-        if not query:
+        query = _build_query(port.product, port.version, port.service)
+        cpe = getattr(port, 'cpe', "")
+        
+        # Even if query is empty, we might have a cpe
+        if not query and not cpe:
             continue
 
-        nvd_results = search_nvd(query)
+        nvd_results = search_nvd(query, cpe)
 
         if isinstance(nvd_results, list) and len(nvd_results) > 0:
             for vuln in nvd_results:

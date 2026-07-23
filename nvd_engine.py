@@ -3,20 +3,37 @@ import time
 
 NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
 
-def search_nvd(keyword):
-    # Clean up bad keywords before searching
-    if not keyword or keyword.strip() in ("None", "", "None None"):
-        return []
+def search_nvd(keyword: str, cpe: str = ""):
+    params = {"resultsPerPage": 5}
+    
+    if cpe and cpe.startswith("cpe:/"):
+        # NVD API 2.0 uses virtualMatchString for partial CPE matching, 
+        # or cpeName for exact. Since nmap CPEs are usually 2.2 format like cpe:/a:apache:http_server:2.4.7
+        # we can translate it to 2.3 format or just use virtualMatchString
+        # Actually, NVD API 2.0 virtualMatchString requires 2.3 format cpe:2.3:a:...
+        # Since nmap often gives 2.2, let's stick to keywordSearch for the CPE if it doesn't match 2.3 exactly
+        # Or better yet, just pass the CPE as a keyword, which is highly accurate.
+        # Actually, virtualMatchString is safest. Let's try to convert basic 2.2 to 2.3
+        if cpe.startswith("cpe:/"):
+            parts = cpe[5:].split(":")
+            # pad to at least 3 parts (part, vendor, product)
+            while len(parts) < 3:
+                parts.append("-")
+            cpe23 = f"cpe:2.3:{parts[0]}:{parts[1]}:{parts[2]}"
+            if len(parts) > 3:
+                cpe23 += f":{parts[3]}"
+            params["virtualMatchString"] = cpe23
+    else:
+        # Clean up bad keywords before searching
+        if not keyword or keyword.strip() in ("None", "", "None None"):
+            return []
 
-    # Remove "None" from keyword
-    keyword = keyword.replace("None", "").strip()
-    if not keyword:
-        return []
-
-    params = {
-        "keywordSearch": keyword,
-        "resultsPerPage": 5
-    }
+        # Remove "None" from keyword
+        keyword = keyword.replace("None", "").strip()
+        if not keyword:
+            return []
+            
+        params["keywordSearch"] = keyword
 
     try:
         response = requests.get(NVD_API, params=params, timeout=10)

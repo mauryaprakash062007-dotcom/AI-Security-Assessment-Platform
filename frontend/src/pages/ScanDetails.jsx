@@ -1,5 +1,6 @@
 import { useParams, Link } from "react-router-dom";
 import { useEffect, useState, useCallback, useRef } from "react";
+import ReactMarkdown from "react-markdown";
 
 const API = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 const WS_API = API.replace(/^http/, "ws");
@@ -30,19 +31,40 @@ function SevBadge({ severity }) {
   );
 }
 
-function Section({ title, children }) {
+function Section({ title, children, defaultOpen = true }) {
+  const [isOpen, setIsOpen] = useState(defaultOpen);
   return (
     <div style={{
       background: "var(--surface)", border: "1px solid var(--border)",
       borderRadius: 12, padding: "1.5rem", marginBottom: "1.5rem",
     }}>
-      <h2 style={{
-        margin: "0 0 1.2rem", fontSize: "0.85rem", fontWeight: 700,
-        textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--text-muted)",
-      }}>
-        {title}
-      </h2>
-      {children}
+      <div 
+        onClick={() => setIsOpen(!isOpen)}
+        style={{
+          display: "flex", justifyContent: "space-between", alignItems: "center",
+          cursor: "pointer", userSelect: "none"
+        }}
+      >
+        <h2 style={{
+          margin: 0, fontSize: "0.85rem", fontWeight: 700,
+          textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--text-muted)",
+        }}>
+          {title}
+        </h2>
+        <div style={{ 
+          color: "var(--text-muted)", 
+          transform: isOpen ? "rotate(180deg)" : "rotate(0deg)", 
+          transition: "transform 0.2s ease",
+          fontSize: "12px"
+        }}>
+          ▼
+        </div>
+      </div>
+      {isOpen && (
+        <div style={{ marginTop: "1.2rem", animation: "fadeIn 0.3s ease" }}>
+          {children}
+        </div>
+      )}
     </div>
   );
 }
@@ -80,6 +102,8 @@ export default function ScanDetails() {
   const [loadError,   setLoadError]   = useState("");
   const [reportError, setReportError] = useState("");
   const [reportLoading, setReportLoading] = useState(false);
+  const [attackPath, setAttackPath] = useState(null);
+  const [attackPathLoading, setAttackPathLoading] = useState(false);
   const reportLoadedRef = useRef(false);
 
   // Load scan result from DB
@@ -105,12 +129,28 @@ export default function ScanDetails() {
     setReportLoading(true);
     try {
       // Trigger CVE population first
-      await fetch(`${API}/vulnerabilities/${id}`);
+      const vulnRes = await fetch(`${API}/vulnerabilities/${id}`);
+      const vulnData = await vulnRes.json();
+      if (vulnData.ai_remediation) {
+        setScanResult(prev => prev ? { ...prev, ai_remediation: vulnData.ai_remediation } : prev);
+      }
+
       // Then fetch the report
       const res  = await fetch(`${API}/report/${id}`);
       if (!res.ok) { setReportError("Report not available yet."); return; }
       const data = await res.json();
       setReport(data);
+      
+      // Fetch the attack path in parallel
+      setAttackPathLoading(true);
+      fetch(`${API}/scans/${id}/attack-path`)
+        .then(r => r.json())
+        .then(ap => { setAttackPath(ap); setAttackPathLoading(false); })
+        .catch(() => setAttackPathLoading(false));
+        
+      // Reload scan result to update risk score
+      await loadScanResult();
+        
     } catch (e) {
       setReportError("Failed to load report: " + e.message);
     } finally {
@@ -275,10 +315,10 @@ export default function ScanDetails() {
                 {scanResult.target}
               </h1>
               <div style={{ marginTop: 8, fontSize: 13, color: "var(--text-muted)" }}>
-                Started: {new Date(scanResult.created_at).toLocaleString()}
+                Started: {new Date(scanResult.created_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
                 {scanResult.completed_at && (
                   <span style={{ marginLeft: 16 }}>
-                    Finished: {new Date(scanResult.completed_at).toLocaleString()}
+                    Finished: {new Date(scanResult.completed_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}
                   </span>
                 )}
               </div>
@@ -399,9 +439,28 @@ export default function ScanDetails() {
           </div>
         )}
 
+
+
+        {phase === "done" && report && report.ai_remediation && (
+          <Section title="✨ AI Remediation Summary">
+            <div style={{
+              whiteSpace: "pre-wrap",
+              lineHeight: 1.6,
+              fontSize: 14,
+              color: "var(--text)",
+              background: "#1e3a5f11",
+              padding: "1rem",
+              borderRadius: 8,
+              border: "1px solid var(--accent)44"
+            }}>
+              {report.ai_remediation}
+            </div>
+          </Section>
+        )}
+
         {/* Open Ports */}
         {scanResult.open_ports && (
-          <Section title={`Open Ports (${scanResult.open_ports.length})`}>
+          <Section title={`Open Ports (${scanResult.open_ports.length})`} defaultOpen={true}>
             {scanResult.open_ports.length === 0 && phase === "done" ? (
               <div style={{
                 background: "#78350f22", border: "1px solid var(--yellow)",
@@ -436,7 +495,7 @@ export default function ScanDetails() {
 
         {/* Nuclei Findings */}
         {scanResult.nuclei_findings?.length > 0 && (
-          <Section title={`Nuclei Findings (${scanResult.nuclei_findings.length})`}>
+          <Section title={`Nuclei Findings (${scanResult.nuclei_findings.length})`} defaultOpen={false}>
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {scanResult.nuclei_findings.map((f, i) => (
                 <div key={i} style={{
@@ -503,7 +562,7 @@ export default function ScanDetails() {
         )}
 
         {report?.vulnerabilities?.length > 0 && (
-          <Section title={`CVE Vulnerabilities (${report.vulnerabilities.length})`}>
+          <Section title={`CVE Vulnerabilities (${report.vulnerabilities.length})`} defaultOpen={false}>
             <Table
               cols={["CVE", "Severity", "Port", "Service", "Source"]}
               rows={report.vulnerabilities.map((v, i) => (
@@ -521,12 +580,69 @@ export default function ScanDetails() {
           </Section>
         )}
 
-        {/* Executive Summary */}
-        {report?.executive_summary && (
-          <Section title="Executive Summary">
-            <p style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "var(--text-muted)" }}>
-              {report.executive_summary}
+
+
+        {/* AI Remediation */}
+        {scanResult?.ai_remediation && (
+          <Section title="✨ AI Security Analysis & Remediation">
+            <div className="markdown-body" style={{ margin: 0, fontSize: 14, lineHeight: 1.7, color: "var(--text-muted)" }}>
+              <ReactMarkdown>{scanResult.ai_remediation}</ReactMarkdown>
+            </div>
+          </Section>
+        )}
+
+        {/* AI Attack Path (Kill Chain) */}
+        {phase === "done" && attackPathLoading && (
+          <Section title="🗡️ Generating Cyber Kill Chain...">
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+               <div style={{ width: 16, height: 16, borderRadius: "50%", border: "2px solid var(--accent)", borderTopColor: "transparent", animation: "spin 1s linear infinite" }} />
+               <span style={{ fontSize: 14, color: "var(--text-muted)" }}>The AI is analyzing vulnerabilities to construct a potential attack path...</span>
+            </div>
+          </Section>
+        )}
+        
+        {phase === "done" && attackPath && (
+          <Section title="🗡️ AI Cyber Kill Chain (Attack Path)" defaultOpen={false}>
+            <p style={{ margin: "0 0 1rem", fontSize: 14, color: "var(--text)", lineHeight: 1.6 }}>
+              {attackPath.summary}
             </p>
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {attackPath.steps.map((step, idx) => (
+                <div key={idx} style={{ 
+                  display: "flex", gap: 16, 
+                  background: "var(--bg)", 
+                  padding: "1rem", 
+                  borderRadius: 8, 
+                  border: "1px solid var(--border)",
+                  borderLeft: "4px solid var(--red)"
+                }}>
+                  <div style={{ 
+                    width: 32, height: 32, borderRadius: "50%", 
+                    background: "var(--red)", color: "white", 
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontWeight: "bold", flexShrink: 0
+                  }}>
+                    {step.step_number}
+                  </div>
+                  <div>
+                    <h4 style={{ margin: "0 0 0.5rem", color: "var(--accent)" }}>{step.title}</h4>
+                    <p style={{ margin: "0 0 0.5rem", fontSize: 13, color: "var(--text-muted)", lineHeight: 1.5 }}>
+                      {step.description}
+                    </p>
+                    {step.mitre_tactic && (
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                        <span style={{ fontSize: 11, background: "#1e3a5f", color: "#60a5fa", padding: "2px 8px", borderRadius: 12 }}>
+                          {step.mitre_tactic}
+                        </span>
+                        <span style={{ fontSize: 11, background: "#374151", color: "#d1d5db", padding: "2px 8px", borderRadius: 12 }}>
+                          {step.mitre_technique} - {step.mitre_technique_name}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
           </Section>
         )}
 

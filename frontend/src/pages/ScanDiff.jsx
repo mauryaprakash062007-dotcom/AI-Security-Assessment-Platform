@@ -126,7 +126,7 @@ export default function ScanDiff() {
       }}>
         <div style={{ maxWidth: 1100, margin: "0 auto" }}>
           <Link to="/" style={{ color: "var(--text-muted)", fontSize: 13, textDecoration: "none" }}>
-            \u2190 Dashboard
+            ← Dashboard
           </Link>
           <p style={{ color: "var(--red)", marginTop: 20 }}>{error}</p>
         </div>
@@ -159,7 +159,7 @@ export default function ScanDiff() {
           color: "var(--text-muted)", fontSize: 13,
           textDecoration: "none", display: "inline-block", marginBottom: "1.5rem",
         }}>
-          \u2190 Dashboard
+          ← Dashboard
         </Link>
 
         {/* Header */}
@@ -209,7 +209,7 @@ export default function ScanDiff() {
                     #{id}
                   </Link>
                   <span style={{ color: "var(--text-muted)", marginLeft: 8, fontWeight: 400, fontSize: 12 }}>
-                    {scan.created_at ? new Date(scan.created_at).toLocaleString() : "\u2014"}
+                    {scan.created_at ? new Date(scan.created_at).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "\u2014"}
                   </span>
                 </div>
               </div>
@@ -250,7 +250,7 @@ export default function ScanDiff() {
             }}>
               {deltaSign}{scoreDelta}
             </div>
-            <div style={{ fontSize: 22, color: "var(--text-muted)" }}>\u2192</div>
+            <div style={{ fontSize: 22, color: "var(--text-muted)" }}>→</div>
           </div>
 
           <div style={{
@@ -447,7 +447,7 @@ export default function ScanDiff() {
             borderRadius: 8, fontWeight: 700, fontSize: 14,
             textDecoration: "none", fontFamily: "var(--font-mono)",
           }}>
-            \u2190 Dashboard
+            ← Dashboard
           </Link>
         </div>
       </div>

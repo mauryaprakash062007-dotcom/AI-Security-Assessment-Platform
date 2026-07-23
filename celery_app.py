@@ -32,4 +32,12 @@ celery_app.conf.update(
     # Prevent a hung Nmap/Nuclei process from blocking the worker forever
     task_time_limit=1500,       # hard kill after 25 min
     task_soft_time_limit=1200,  # SIGTERM after 20 min (lets us clean up)
+    
+    # Scheduled Tasks (Celery Beat)
+    beat_schedule={
+        "poll_zero_days_every_12_hours": {
+            "task": "tasks.poll_threat_intelligence",
+            "schedule": 43200.0, # 12 hours in seconds
+        }
+    }
 )

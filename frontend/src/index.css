@@ -9,3 +9,28 @@
   --green: #4ade80; --red: #f87171; --yellow: #fbbf24;
   --font-mono: monospace; --font-display: sans-serif;
 }
+
+.markdown-body h1, .markdown-body h2, .markdown-body h3 {
+  color: var(--text);
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+  font-weight: 700;
+}
+.markdown-body h2 {
+  font-size: 1.2em;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3em;
+}
+.markdown-body p {
+  margin-bottom: 1em;
+}
+.markdown-body ul, .markdown-body ol {
+  padding-left: 1.5em;
+  margin-bottom: 1em;
+}
+.markdown-body li {
+  margin-bottom: 0.25em;
+}
+.markdown-body strong {
+  color: var(--accent);
+}

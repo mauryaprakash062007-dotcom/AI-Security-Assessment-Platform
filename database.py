@@ -1,6 +1,6 @@
 import os
 from sqlmodel import SQLModel, create_engine,Session
-from models import Scan,Port
+from models import Scan, Port, Vulnerability, NucleiFinding, AttackPath, AttackPathStep, ZeroDayAlert
 
 # Reads from env so this works unchanged on localhost, a VM, or in Docker
 # (docker-compose sets DATABASE_URL=postgresql://postgres:postgres@db/security_platform).

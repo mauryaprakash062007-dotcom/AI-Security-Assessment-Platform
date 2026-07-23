@@ -3,6 +3,7 @@ FROM golang:1.24-alpine AS nuclei-builder
 RUN apk add --no-cache git
 ENV GOTOOLCHAIN=auto
 RUN CGO_ENABLED=0 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+RUN CGO_ENABLED=0 go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
 
 # ── Stage 2: the actual backend image ────────────────────────────────────────
 FROM python:3.11-slim
@@ -16,8 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Bring the nuclei binary in from the build stage
+# Bring the binaries in from the build stage
 COPY --from=nuclei-builder /go/bin/nuclei /usr/local/bin/nuclei
+COPY --from=nuclei-builder /go/bin/subfinder /usr/local/bin/subfinder
 
 # Pull the nuclei templates once at build time so scans don't need to
 # download them on first run. (Refresh manually with `nuclei -update-templates`

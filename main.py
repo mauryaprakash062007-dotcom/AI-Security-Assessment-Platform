@@ -10,10 +10,15 @@ import io
 import json as json_mod
 from datetime import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from auth import get_api_key
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from input_validator import validate_target, ValidationError
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from sqlmodel import select
@@ -21,13 +26,17 @@ from sqlmodel import select
 from celery_app import celery_app
 from cve_engine import lookup_vulnerabilities
 from database import create_db_and_tables, get_session
-from models import NucleiFinding, Port, Scan, Vulnerability
+from models import NucleiFinding, Port, Scan, Vulnerability, ZeroDayAlert, AttackPath, AttackPathStep
 from nvd_engine import search_nvd
-from ml_risk_engine import calculate_ml_risk
+from cvss_risk_engine import calculate_risk_score
 from tasks import run_scan_pipeline
 from unified_engine import get_unified_vulnerabilities
 
 app = FastAPI(title="Security Platform API – Async Edition")
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,16 +56,25 @@ def on_startup():
 def read_root():
     return {"message": "Security Assessment Platform Backend is running."}
 
+@app.get("/api/auth/verify")
+def verify_auth(api_key: str = Depends(get_api_key)):
+    return {"status": "ok", "message": "Authenticated"}
 
 class ScanRequest(BaseModel):
     target: str
 
 
 @app.post("/scan", status_code=202)
-def start_scan(body: ScanRequest):
+@limiter.limit("5/minute")
+def start_scan(request: Request, body: ScanRequest, api_key: str = Depends(get_api_key)):
     target = body.target.strip()
     if not target:
         raise HTTPException(status_code=400, detail="target must not be empty")
+
+    try:
+        validate_target(target)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     with get_session() as session:
         scan_record = Scan(target=target, status="queued", phase="queued")
@@ -82,7 +100,7 @@ def start_scan(body: ScanRequest):
 
 
 @app.get("/scan/status/{task_id}")
-def get_task_status(task_id: str):
+def get_task_status(task_id: str, api_key: str = Depends(get_api_key)):
     result = celery_app.AsyncResult(task_id)
 
     response: dict = {
@@ -107,7 +125,7 @@ def get_task_status(task_id: str):
 
 
 @app.get("/scan/result/{scan_id}")
-def get_scan_result(scan_id: int):
+def get_scan_result(scan_id: int, api_key: str = Depends(get_api_key)):
     with get_session() as session:
         scan = session.get(Scan, scan_id)
         if not scan:
@@ -127,12 +145,23 @@ def get_scan_result(scan_id: int):
             if sev in severity_summary:
                 severity_summary[sev] += 1
 
-        scan_result_for_ml = {
-            "open_ports":       [{"port": p.port, "is_web": p.is_web} for p in ports],
-            "nuclei_findings":  [{"severity": f.severity} for f in nuclei_findings],
-            "severity_summary": severity_summary,
-        }
-        risk = calculate_ml_risk(scan_result_for_ml, [])
+        # Fetch CVEs for risk calculation (if they exist in DB)
+        vulnerabilities_in_db = session.exec(
+            select(Vulnerability).join(Port, Vulnerability.port_id == Port.id).where(Port.scan_id == scan_id)
+        ).all()
+        risk_score = calculate_risk_score(vulnerabilities_in_db, nuclei_findings)
+        
+        # Risk level determination based on standard CVSS tiers
+        if risk_score >= 90:
+            risk_level = "Critical"
+        elif risk_score >= 70:
+            risk_level = "High"
+        elif risk_score >= 40:
+            risk_level = "Medium"
+        elif risk_score > 0:
+            risk_level = "Low"
+        else:
+            risk_level = "Safe"
 
         return {
             "scan_id":          scan_id,
@@ -141,6 +170,7 @@ def get_scan_result(scan_id: int):
             "phase":            scan.phase,
             "created_at":       scan.created_at,
             "completed_at":     scan.completed_at,
+            "ai_remediation":   scan.ai_remediation,
             "open_ports":       [
                 {
                     "port":    p.port,
@@ -165,20 +195,28 @@ def get_scan_result(scan_id: int):
             ],
             "severity_summary": severity_summary,
             "total_findings":   len(nuclei_findings),
-            "risk_score":       risk["risk_score"],
-            "risk_level":       risk["risk_level"],
+            "risk_score":       risk_score,
+            "risk_level":       risk_level,
         }
 
 
 @app.get("/history")
-def get_scan_history():
+def get_scan_history(api_key: str = Depends(get_api_key)):
     with get_session() as session:
         scans = session.exec(select(Scan)).all()
         return scans
 
 
+@app.get("/zero-day-alerts")
+def get_zero_day_alerts(api_key: str = Depends(get_api_key)):
+    """Retrieve all autonomous zero-day alerts generated by the ATEM engine."""
+    with get_session() as session:
+        alerts = session.exec(select(ZeroDayAlert).order_by(ZeroDayAlert.discovered_at.desc())).all()
+        return alerts
+
+
 @app.get("/history/{scan_id}")
-def get_scan(scan_id: int):
+def get_scan(scan_id: int, api_key: str = Depends(get_api_key)):
     with get_session() as session:
         scan = session.get(Scan, scan_id)
         if not scan:
@@ -190,7 +228,7 @@ def get_scan(scan_id: int):
 
 
 @app.get("/vulnerabilities/{scan_id}")
-def get_vulnerabilities(scan_id: int):
+def get_vulnerabilities(scan_id: int, api_key: str = Depends(get_api_key)):
     with get_session() as session:
         ports = session.exec(
             select(Port).where(Port.scan_id == scan_id)
@@ -198,60 +236,154 @@ def get_vulnerabilities(scan_id: int):
         findings = []
         severity_summary = {"critical": 0, "high": 0, "medium": 0, "low": 0}
 
-        for port in ports:
-            vulnerabilities = lookup_vulnerabilities(port.product, port.version)
-            for vuln in vulnerabilities:
-                existing = session.exec(
-                    select(Vulnerability).where(
-                        Vulnerability.port_id == port.id,
-                        Vulnerability.cve_id == vuln["cve"],
+        vulnerabilities = get_unified_vulnerabilities(ports)
+        for vuln in vulnerabilities:
+            # Find the corresponding port to link the vulnerability
+            port = next((p for p in ports if p.port == vuln["port"]), None)
+            if not port:
+                continue
+            
+            existing = session.exec(
+                select(Vulnerability).where(
+                    Vulnerability.port_id == port.id,
+                    Vulnerability.cve_id == vuln["cve"],
+                )
+            ).first()
+            if not existing:
+                session.add(
+                    Vulnerability(
+                        port_id=port.id,
+                        cve_id=vuln["cve"],
+                        severity=vuln["severity"],
+                        description=vuln["description"],
                     )
-                ).first()
-                if not existing:
-                    session.add(
-                        Vulnerability(
-                            port_id=port.id,
-                            cve_id=vuln["cve"],
-                            severity=vuln["severity"],
-                            description=vuln["description"],
-                        )
-                    )
-                sev = vuln["severity"].lower()
-                if sev in severity_summary:
-                    severity_summary[sev] += 1
-                findings.append({
-                    "port": port.port, "service": port.service,
-                    "product": port.product, "version": port.version,
-                    "cve": vuln["cve"], "severity": vuln["severity"],
-                    "description": vuln["description"],
-                })
+                )
+            sev = vuln.get("severity", "unknown").lower()
+            if sev in severity_summary:
+                severity_summary[sev] += 1
+            findings.append({
+                "port": port.port, "service": port.service,
+                "product": port.product, "version": port.version,
+                "cve": vuln["cve"], "severity": vuln["severity"],
+                "description": vuln["description"],
+            })
 
         session.commit()
+
+        scan = session.get(Scan, scan_id)
+        if scan and not scan.ai_remediation:
+            from ai_remediation import generate_remediation_summary
+            nuclei_findings = session.exec(select(NucleiFinding).where(NucleiFinding.scan_id == scan_id)).all()
+            nuclei_list = [{"template_id": f.template_id, "severity": f.severity} for f in nuclei_findings]
+            vuln_list = [{"cve": v.cve_id, "severity": v.severity, "port": p.port} for v in session.exec(select(Vulnerability).where(Vulnerability.port_id.in_([p.id for p in ports]))) for p in ports if p.id == v.port_id]
+            
+            scan.ai_remediation = generate_remediation_summary(vuln_list, nuclei_list)
+            session.add(scan)
+            session.commit()
+
         return {
             "scan_id": scan_id,
             "summary": severity_summary,
             "total_vulnerabilities": len(findings),
             "vulnerabilities": findings,
+            "ai_remediation": scan.ai_remediation if scan else None,
+        }
+
+@app.get("/scans/{scan_id}/attack-path")
+def get_attack_path(scan_id: int, api_key: str = Depends(get_api_key)):
+    with get_session() as session:
+        scan = session.get(Scan, scan_id)
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+            
+        existing_path = session.exec(select(AttackPath).where(AttackPath.scan_id == scan_id)).first()
+        
+        if existing_path:
+            steps = session.exec(select(AttackPathStep).where(AttackPathStep.attack_path_id == existing_path.id).order_by(AttackPathStep.step_number)).all()
+            return {
+                "scan_id": scan_id,
+                "summary": existing_path.summary,
+                "steps": [s.model_dump() for s in steps]
+            }
+            
+        # If it doesn't exist, generate it
+        from ai_threat_modeler import generate_attack_path
+        
+        ports = session.exec(select(Port).where(Port.scan_id == scan_id)).all()
+        nuclei_findings = session.exec(select(NucleiFinding).where(NucleiFinding.scan_id == scan_id)).all()
+        nuclei_list = [{"template_id": f.template_id, "severity": f.severity} for f in nuclei_findings]
+        vuln_list = [{"cve": v.cve_id, "severity": v.severity, "port": p.port} for v in session.exec(select(Vulnerability).where(Vulnerability.port_id.in_([p.id for p in ports]))) for p in ports if p.id == v.port_id]
+        
+        ap_data = generate_attack_path(vuln_list, nuclei_list, scan.waf_status)
+        
+        if ap_data.get("summary", "").startswith("Failed to generate AI attack path"):
+            return {
+                "scan_id": scan_id,
+                "summary": ap_data.get("summary"),
+                "steps": []
+            }
+            
+        new_path = AttackPath(scan_id=scan_id, summary=ap_data.get("summary", "Generated Attack Path"))
+        session.add(new_path)
+        session.commit()
+        session.refresh(new_path)
+        
+        for step_data in ap_data.get("steps", []):
+            step = AttackPathStep(
+                attack_path_id=new_path.id,
+                step_number=step_data.get("step_number", 1),
+                title=step_data.get("title", ""),
+                description=step_data.get("description", ""),
+                mitre_tactic=step_data.get("mitre_tactic"),
+                mitre_technique=step_data.get("mitre_technique"),
+                mitre_technique_name=step_data.get("mitre_technique_name")
+            )
+            session.add(step)
+        
+        session.commit()
+        
+        # Return the generated data
+        return {
+            "scan_id": scan_id,
+            "summary": new_path.summary,
+            "steps": ap_data.get("steps", [])
         }
 
 
+
+def _get_db_vulnerabilities(session, ports):
+    port_ids = [p.id for p in ports]
+    if not port_ids:
+        return []
+    db_vulns = session.exec(select(Vulnerability).where(Vulnerability.port_id.in_(port_ids))).all()
+    
+    vuln_results = []
+    for v in db_vulns:
+        port = next((p for p in ports if p.id == v.port_id), None)
+        vuln_results.append({
+            "cve": v.cve_id,
+            "severity": v.severity,
+            "description": v.description,
+            "port": port.port if port else None,
+            "service": port.service if port else None,
+            "product": port.product if port else None,
+            "version": port.version if port else None,
+            "source": "DB"
+        })
+    return vuln_results
+
 @app.get("/stored-vulnerabilities/{scan_id}")
-def get_stored_vulnerabilities(scan_id: int):
+def get_stored_vulnerabilities(scan_id: int, api_key: str = Depends(get_api_key)):
     with get_session() as session:
         ports = session.exec(
             select(Port).where(Port.scan_id == scan_id)
         ).all()
-        port_ids = {p.id for p in ports}
-        all_vulns = session.exec(select(Vulnerability)).all()
-        results = [
-            {"cve": v.cve_id, "severity": v.severity, "description": v.description}
-            for v in all_vulns if v.port_id in port_ids
-        ]
+        results = _get_db_vulnerabilities(session, ports)
         return {"scan_id": scan_id, "stored_vulnerabilities": results}
 
 
 @app.get("/report/{scan_id}")
-def generate_report(scan_id: int):
+def generate_report(scan_id: int, api_key: str = Depends(get_api_key)):
     with get_session() as session:
         scan = session.get(Scan, scan_id)
         if not scan:
@@ -260,8 +392,7 @@ def generate_report(scan_id: int):
         nuclei_findings = session.exec(
             select(NucleiFinding).where(NucleiFinding.scan_id == scan_id)
         ).all()
-
-    vuln_results = get_unified_vulnerabilities(ports)
+        vuln_results = _get_db_vulnerabilities(session, ports)
 
     summary = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for vuln in vuln_results:
@@ -274,12 +405,18 @@ def generate_report(scan_id: int):
         sev = (f.severity or "info").lower()
         if sev in nuclei_sev:
             nuclei_sev[sev] += 1
-    scan_result_for_ml = {
-        "open_ports":       [{"port": p.port, "is_web": p.is_web} for p in ports],
-        "nuclei_findings":  [{"severity": f.severity} for f in nuclei_findings],
-        "severity_summary": nuclei_sev,
-    }
-    risk = calculate_ml_risk(scan_result_for_ml, vuln_results)
+    risk_score = calculate_risk_score(vuln_results, nuclei_findings)
+    if risk_score >= 90:
+        risk_level = "Critical"
+    elif risk_score >= 70:
+        risk_level = "High"
+    elif risk_score >= 40:
+        risk_level = "Medium"
+    elif risk_score > 0:
+        risk_level = "Low"
+    else:
+        risk_level = "Safe"
+
     high_count = summary["high"] + summary["critical"]
     executive_summary = (
         f"{len(vuln_results)} vulnerabilities detected. "
@@ -289,8 +426,8 @@ def generate_report(scan_id: int):
         "target":            scan.target,
         "status":            scan.status,
         "scan_date":         scan.created_at,
-        "risk_score":        risk["risk_score"],
-        "risk_level":        risk["risk_level"],
+        "risk_score":        risk_score,
+        "risk_level":        risk_level,
         "executive_summary": executive_summary,
         "summary":           summary,
         "ports":             ports,
@@ -299,7 +436,7 @@ def generate_report(scan_id: int):
 
 
 @app.get("/report/{scan_id}/pdf")
-def generate_pdf_report(scan_id: int):
+def generate_pdf_report(scan_id: int, api_key: str = Depends(get_api_key)):
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import cm
@@ -314,8 +451,17 @@ def generate_pdf_report(scan_id: int):
         nuclei_findings = session.exec(
             select(NucleiFinding).where(NucleiFinding.scan_id == scan_id)
         ).all()
+        
+        attack_path = session.exec(select(AttackPath).where(AttackPath.scan_id == scan_id)).first()
+        attack_path_steps = []
+        if attack_path:
+            attack_path_steps = session.exec(
+                select(AttackPathStep)
+                .where(AttackPathStep.attack_path_id == attack_path.id)
+                .order_by(AttackPathStep.step_number)
+            ).all()
 
-    vuln_results = get_unified_vulnerabilities(ports)
+        vuln_results = _get_db_vulnerabilities(session, ports)
 
     nuclei_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
     for f in nuclei_findings:
@@ -323,13 +469,18 @@ def generate_pdf_report(scan_id: int):
         if sev in nuclei_sev:
             nuclei_sev[sev] += 1
 
-    scan_result = {
-        "open_ports": [{"port": p.port, "service": p.service, "product": p.product,
-                        "version": p.version, "is_web": p.is_web} for p in ports],
-        "nuclei_findings":  [{"severity": f.severity} for f in nuclei_findings],
-        "severity_summary": nuclei_sev,
-    }
-    risk = calculate_ml_risk(scan_result, vuln_results)
+    risk_score = calculate_risk_score(vuln_results, nuclei_findings)
+    if risk_score >= 90:
+        risk_level = "Critical"
+    elif risk_score >= 70:
+        risk_level = "High"
+    elif risk_score >= 40:
+        risk_level = "Medium"
+    elif risk_score > 0:
+        risk_level = "Low"
+    else:
+        risk_level = "Safe"
+    risk = {"risk_score": risk_score, "risk_level": risk_level, "confidence": 0.8}
 
     summary = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for v in vuln_results:
@@ -475,6 +626,36 @@ def generate_pdf_report(scan_id: int):
             content.append(Spacer(1, 4))
     else:
         content.append(Paragraph("No CVE vulnerabilities found.", style_body))
+    content.append(Spacer(1, 12))
+
+    if scan.ai_remediation:
+        content.append(Paragraph("AI Security Analysis & Remediation", style_h2))
+        
+        # We need to sanitize and format the markdown for ReportLab slightly
+        # We can just split by double newline for paragraphs and strip out markdown artifacts
+        remediation_paragraphs = scan.ai_remediation.split('\n\n')
+        for para in remediation_paragraphs:
+            # ReportLab requires valid XML if using Paragraphs, so we strip bold markdown
+            cleaned_para = para.replace('**', '')
+            # Escape HTML chars to prevent XML parsing errors
+            cleaned_para = cleaned_para.replace('<', '&lt;').replace('>', '&gt;')
+            
+            content.append(Paragraph(cleaned_para, style_body))
+            content.append(Spacer(1, 6))
+
+    if attack_path:
+        content.append(Paragraph("Cyber Kill Chain (Attack Path)", style_h2))
+        content.append(Paragraph(attack_path.summary, style_body))
+        content.append(Spacer(1, 6))
+        
+        for step in attack_path_steps:
+            step_text = (
+                f"<b>Step {step.step_number}: {step.title}</b><br/>"
+                f"<i>{step.mitre_tactic} - {step.mitre_technique} ({step.mitre_technique_name})</i><br/>"
+                f"{step.description}"
+            )
+            content.append(Paragraph(step_text, style_body))
+            content.append(Spacer(1, 6))
 
     doc.build(content)
     return FileResponse(
@@ -487,7 +668,7 @@ def generate_pdf_report(scan_id: int):
 # ── JSON export ───────────────────────────────────────────────────────────────
 
 @app.get("/report/{scan_id}/json")
-def generate_json_report(scan_id: int):
+def generate_json_report(scan_id: int, api_key: str = Depends(get_api_key)):
     """Download the full scan report as a JSON file."""
     with get_session() as session:
         scan = session.get(Scan, scan_id)
@@ -506,12 +687,18 @@ def generate_json_report(scan_id: int):
         if sev in nuclei_sev:
             nuclei_sev[sev] += 1
 
-    scan_result_for_ml = {
-        "open_ports":      [{"port": p.port, "is_web": p.is_web} for p in ports],
-        "nuclei_findings": [{"severity": f.severity} for f in nuclei_findings],
-        "severity_summary": nuclei_sev,
-    }
-    risk = calculate_ml_risk(scan_result_for_ml, vuln_results)
+    risk_score = calculate_risk_score(vuln_results, nuclei_findings)
+    if risk_score >= 90:
+        risk_level = "Critical"
+    elif risk_score >= 70:
+        risk_level = "High"
+    elif risk_score >= 40:
+        risk_level = "Medium"
+    elif risk_score > 0:
+        risk_level = "Low"
+    else:
+        risk_level = "Safe"
+    risk = {"risk_score": risk_score, "risk_level": risk_level, "confidence": 0.8}
 
     report_data = {
         "scan_id":         scan_id,
@@ -535,6 +722,7 @@ def generate_json_report(scan_id: int):
             for f in nuclei_findings
         ],
         "cve_vulnerabilities": vuln_results,
+        "ai_remediation": scan.ai_remediation,
     }
 
     json_bytes = json_mod.dumps(report_data, indent=2, default=str).encode("utf-8")
@@ -548,7 +736,7 @@ def generate_json_report(scan_id: int):
 # ── CSV export ────────────────────────────────────────────────────────────────
 
 @app.get("/report/{scan_id}/csv")
-def generate_csv_report(scan_id: int):
+def generate_csv_report(scan_id: int, api_key: str = Depends(get_api_key)):
     """Download the scan report as a flat CSV file."""
     with get_session() as session:
         scan = session.get(Scan, scan_id)
@@ -591,6 +779,13 @@ def generate_csv_report(scan_id: int):
             v.get("product", ""), v.get("version", ""),
             v.get("severity", ""), v.get("cve", ""), "",
             (v.get("description", "") or "")[:500], "", "",
+        ])
+
+    # AI Remediation
+    if scan.ai_remediation:
+        writer.writerow([
+            "ai_remediation", "", "", "", "",
+            "", "", "", scan.ai_remediation, "", "",
         ])
 
     buf.seek(0)
@@ -698,17 +893,18 @@ def diff_scans(scan_a: int = Query(...), scan_b: int = Query(...)):
 
     # ── Risk delta ────────────────────────────────────────────────────────
     def risk_for(ports_list, nf_list):
-        sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
-        for f in nf_list:
-            s = (f.severity or "info").lower()
-            if s in sev:
-                sev[s] += 1
-        sr = {
-            "open_ports":      [{"port": p.port, "is_web": p.is_web} for p in ports_list],
-            "nuclei_findings": [{"severity": f.severity} for f in nf_list],
-            "severity_summary": sev,
-        }
-        return calculate_ml_risk(sr, [])
+        risk_score = calculate_risk_score([], nf_list)
+        if risk_score >= 90:
+            risk_level = "Critical"
+        elif risk_score >= 70:
+            risk_level = "High"
+        elif risk_score >= 40:
+            risk_level = "Medium"
+        elif risk_score > 0:
+            risk_level = "Low"
+        else:
+            risk_level = "Safe"
+        return {"risk_score": risk_score, "risk_level": risk_level}
 
     risk_a = risk_for(ports_a, nf_a)
     risk_b = risk_for(ports_b, nf_b)
